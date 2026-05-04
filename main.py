@@ -12,7 +12,7 @@ logger = logging.getLogger(__name__)
 API_BASE = "https://data.dubhenexus.org/api"
 
 
-@register("astrbot_plugin_dubhe_nexus_info_inquiry", "Dubhe Nexus Innovation and Research Studio", "航空数据查询：机场信息、METAR、TAF、ATIS、NOTAM", "1.0.0")
+@register("astrbot_plugin_dubhe_nexus_info_inquiry", "Dubhe Nexus Innovation and Research Studio", "航空数据查询：机场信息、METAR、TAF、ATIS、NOTAM", "1.0.2")
 class DubheNexusAviationPlugin(Star):
     def __init__(self, context: Context, config=None):
         super().__init__(context)
