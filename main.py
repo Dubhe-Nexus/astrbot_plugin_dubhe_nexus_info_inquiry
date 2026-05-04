@@ -51,14 +51,46 @@ class DubheNexusAviationPlugin(Star):
             raw_data = data.get("data")
             if isinstance(raw_data, dict):
                 lines = []
+
+                info = f"{raw_data.get('name', 'N/A')}"
+                if raw_data.get("iataId"):
+                    info += f" ({raw_data['iataId']})"
+                lines.append(info)
+
+                loc = f"{raw_data.get('icaoId', icao)}"
+                if raw_data.get("country") or raw_data.get("state"):
+                    parts = [p for p in [raw_data.get("state"), raw_data.get("country")] if p]
+                    loc += f" · {'/'.join(parts)}"
+                lines.append(loc)
+
+                coord = f"{raw_data.get('lat', '?')}, {raw_data.get('lon', '?')}"
+                if raw_data.get("elev") is not None:
+                    coord += f" · {raw_data['elev']}ft"
+                if raw_data.get("magdec"):
+                    coord += f" · 磁差 {raw_data['magdec']}"
+                lines.append(coord)
+
+                rwy_parts = []
+                if raw_data.get("rwyNum"):
+                    rwy_parts.append(f"{raw_data['rwyNum']}条")
+                if raw_data.get("rwyLength"):
+                    rwy_parts.append(raw_data['rwyLength'])
+                rwy_info = f"跑道: {' '.join(rwy_parts)}" if rwy_parts else ""
+                if raw_data.get("runways"):
+                    rwy_list = ", ".join(
+                        f"{r['id']} ({r['lengthM']}m×{r['widthM']}m, {r['surface']})"
+                        for r in raw_data["runways"]
+                    )
+                    rwy_info += f"\n    {rwy_list}" if rwy_info else f"跑道: {rwy_list}"
+                if rwy_info:
+                    lines.append(rwy_info)
+
                 if raw_data.get("rawMETAR"):
-                    lines.append(raw_data["rawMETAR"])
+                    lines.append(f"\nMETAR:\n{raw_data['rawMETAR']}")
                 if raw_data.get("rawTAF"):
-                    lines.append(raw_data["rawTAF"])
-                if lines:
-                    yield event.plain_result("\n\n".join(lines))
-                else:
-                    yield event.plain_result(json.dumps(raw_data, ensure_ascii=False))
+                    lines.append(f"\nTAF:\n{raw_data['rawTAF']}")
+
+                yield event.plain_result("\n".join(lines))
             else:
                 yield event.plain_result(str(raw_data) if raw_data else json.dumps(data, ensure_ascii=False))
         except Exception as e:
@@ -70,7 +102,7 @@ class DubheNexusAviationPlugin(Star):
         self._disable_ai_and_cache(event)
         args = self._parse_args(event)
         if len(args) < 2:
-            yield event.plain_result("用法: /metar <ICAO代码>\n例如: /metar VHHH")
+            yield event.plain_result("用法: /metar <ICAO代码>")
             return
         icao = args[1].upper()
         try:
@@ -89,7 +121,7 @@ class DubheNexusAviationPlugin(Star):
         self._disable_ai_and_cache(event)
         args = self._parse_args(event)
         if len(args) < 2:
-            yield event.plain_result("用法: /taf <ICAO代码>\n例如: /taf VHHH")
+            yield event.plain_result("用法: /taf <ICAO代码>")
             return
         icao = args[1].upper()
         try:
@@ -110,7 +142,7 @@ class DubheNexusAviationPlugin(Star):
         if len(args) >= 2:
             icao = args[1].upper()
             if icao != "VHHH":
-                yield event.plain_result("目前仅支持香港国际机场的 ATIS 查询。\n用法: /atis")
+                yield event.plain_result("目前仅支持香港国际机场的 ATIS 查询。")
                 return
         try:
             data = await self._fetch_json("/airport/atis/VHHH")
@@ -133,7 +165,7 @@ class DubheNexusAviationPlugin(Star):
         if len(args) >= 2:
             icao = args[1].upper()
             if icao != "VHHH":
-                yield event.plain_result("目前仅支持香港国际机场的 NOTAM 查询。\n用法: /notam")
+                yield event.plain_result("目前仅支持香港国际机场的 NOTAM 查询。")
                 return
         try:
             data = await self._fetch_json("/airport/notam/VHHH")
