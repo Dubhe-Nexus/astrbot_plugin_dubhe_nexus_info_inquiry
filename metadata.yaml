@@ -1,0 +1,6 @@
+name: Dubhe_Nexus_Info_Inquiry
+display_name: 天枢互联航空信息查询
+desc: 航空数据查询：机场信息、METAR、TAF、ATIS、NOTAM
+version: v1.0.0
+author: Dubhe Nexus Innovation and Research Studio
+repo: https://github.com/Dubhe-Nexus/QQ-Bot-Plugin/tree/main/Dubhe_Nexus_Info_Inquiry
