@@ -1,38 +1,148 @@
 from __future__ import annotations
 
 import json
-import logging
+import re
+from datetime import datetime, timezone
 
 import httpx
 from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.star import Context, Star, register
-
-logger = logging.getLogger(__name__)
+from astrbot.api import logger
 
 API_BASE = "https://data.dubhenexus.org/api"
 
+# ── 航空关键词 ─────────────────────────────────────────
 AVIATION_KEYWORDS = [
-    "metar", "taf", "atis", "notam"
+    "metar", "taf", "atis", "notam",
+    "气象", "天气", "weather", "报文",
+    "机场", "airport", "跑道", "runway",
+    "起降", "航空", 
 ]
 
-import re
-
 ICAO_PATTERN = re.compile(r"\b([A-Za-z]{4})\b")
-
 ROUTABLE_ICAO_PREFIXES = frozenset("VZRPYOBG")
+COMMAND_PLATFORMS = frozenset({"isfp", "skylite"})
+
+# ── LLM 注入的知识 ──────────────────────────────────────
+DUBHE_NEXUS_KNOWLEDGE = """
+## 关于天枢互联 Dubhe Nexus
+
+天枢互联创研工作室（Dubhe Nexus Innovation and Research Studio）是一支由模拟飞行爱好者、
+开发者与 Minecraft 玩家组成的独立技术团队。我们保持轻量与灵活，拒绝复杂的商业架构，
+致力于在模拟飞行生态、电子飞行包（EFB）工具及数据接口服务（Open API）上做出扎实的产出。
+与此同时，我们也在虚拟世界另一端的「星图港」里，用方块构建对城市与天际线的想象。
+
+作为学生出身的技术同好，我们信奉实用主义，以 AI 辅助开发——在学业之余，借助 AI 大模型提升开发效率，
+将有限的精力集中在干净的代码和简洁的交互上，只为给社区在数据查询与协同效率上带来真正有用的帮助。
+
+### Open API（data.dubhenexus.org）
+
+机场数据接口：
+- /api/airport/:icao        机场基础信息（名称、跑道、坐标、海拔等）
+- /api/airport/metar/:icao  METAR 实时观测气象
+- /api/airport/taf/:icao    TAF 航站预报
+- /api/airport/atis/:icao   ATIS 通播（仅支持 VHHH 香港国际机场）
+- /api/airport/notam/:icao  NOTAM 航行通告（仅支持 VHHH 香港国际机场）
+
+在线航班接口：
+- /api/flights/isfp         ISFP 在线机组
+- /api/flights/skylite      SkyLite 在线机组
+- /api/flights/vatsim       VATSIM 在线机组
+- /api/flights/volanta      Volanta 在线机组
+- /api/flights/apoc         APOC 在线机组
+- /api/flights/planepals    PlanePals 在线机组
+
+### Bot 内置指令
+
+- /airport <ICAO>          查询机场资料详情
+- /metar <ICAO>            查询 METAR 实时气象报文
+- /taf <ICAO>              查询 TAF 航站预报
+- /atis [DEP/ARR] <ICAO>   查询 ATIS 通播（仅 VHHH，可选 DEP/ARR 指定进离场）
+- /notam                   查询 VHHH NOTAM 航行通告
+- /weather <ICAO>          综合气象查询（含 METAR + TAF 解读）
+- /flight <ISFP/SkyLite>           查看在线机组列表
+- /flight <ISFP/SkyLite> <呼号>     按呼号查特定机组详细信息
+
+### EFB 网页
+
+中文版：
+- 气象查询：https://efb.dubhenexus.org/weather
+- 机场资料：https://efb.dubhenexus.org/info
+- 航图查询：https://efb.dubhenexus.org/charts
+- 航路查询：https://efb.dubhenexus.org/routes
+- 起降性能：https://efb.dubhenexus.org/performance
+
+英文版（en）：
+- 机场资料：https://efb.dubhenexus.org/en/info?icao=:icao
+- 气象查询：https://efb.dubhenexus.org/en/weather?icao=:icao
+- 航图（ChartFox）：https://efb.dubhenexus.org/en/charts?icao=:icao&provider=chartfox
+- 航图（Jeppesen）：https://efb.dubhenexus.org/en/charts?icao=:icao&provider=jeppesen
+- 航路查询：https://efb.dubhenexus.org/en/routes
+- 起降性能：https://efb.dubhenexus.org/en/performance
+- 航班追踪：https://efb.dubhenexus.org/flights（测试中，效果可能不太好）
+
+当用户询问航图时，如果不确定应该引导至 ChartFox 还是 Jeppesen 来源，可询问用户偏好；
+默认推荐 ChartFox（免费且覆盖较广）。
+
+### 官网
+
+https://www.dubhenexus.org
+
+### 联系我们
+
+- info@dubhenexus.org      一般查询
+- support@dubhenexus.org   反馈 / 建议 / 投诉 / 支持
+- dev@dubhenexus.org       开发组（非严重或特殊情况下不要主动联系）
+- collab@dubhenexus.org    合作洽谈
+
+### 行为准则
+
+1. 你是天枢互联 Dubhe Nexus 的航空助手，具备专业的航空数据查询与解读能力。
+2. 只在群聊中有人明确询问航空相关问题时才介入回复，不要主动打断别人的对话。
+3. 当用户表达的需求不够清晰时（例如只说"查天气"但没给 ICAO），简洁地询问补充信息，
+   而不是一次抛出所有选项。
+4. 回复时优先使用自然语言解读数据，提供清晰有用的信息；同时可以附上对应的 EFB 网页链接，
+   方便用户自行查看更多细节。
+5. 不要在本回复中机械地罗列所有服务和指令——这些已作为你的背景知识，
+   只在用户问到时再调用相关能力。
+
+### 自然语言查询
+
+当用户 @你 询问以下类型的问题时，你可以直接回答：
+
+- "香港国际机场ICAO代码是啥" → VHHH
+- "香港国际机场metar" → METAR VHHH ...（直接给出报文）
+  附带：详细页面 https://efb.dubhenexus.org/weather?icao=VHHH
+- "ISFP在线航班" → 列出当前在线机组（呼号 + 航线）
+- "查一下CSN1025" → 该机组的详细信息
+
+你不需要引导用户再发一遍指令，而是直接在回复中给出答案。
+"""
 
 
 @register(
-    "astrbot_plugin_dubhe_nexus_info_inquiry",
+    "astrbot_plugin_dubhe_nexus_services",
     "Dubhe Nexus Innovation and Research Studio",
-    "航空数据与气象查询：机场信息、METAR、TAF、ATIS、NOTAM",
+    "天枢互联服务集成：航空数据查询（METAR/TAF/ATIS/NOTAM/机场/气象）、"
+    "在线机组查询（ISFP/SkyLite）、EFB 航图链接引导、知识注入",
     "2.0.0",
 )
-class DubheNexusAviationPlugin(Star):
+class DubheNexusServicesPlugin(Star):
     def __init__(self, context: Context, config=None):
         super().__init__(context)
 
-    # ── HTTP 工具 ────────────────────────────────────────
+    # ══════════════════════════════════════════════════════════
+    # 1. LLM 知识注入
+    # ══════════════════════════════════════════════════════════
+
+    @filter.on_llm_request()
+    async def inject_services_knowledge(self, event: AstrMessageEvent, req):
+        if DUBHE_NEXUS_KNOWLEDGE not in req.system_prompt:
+            req.system_prompt += "\n\n" + DUBHE_NEXUS_KNOWLEDGE
+
+    # ══════════════════════════════════════════════════════════
+    # 2. API 通用方法
+    # ══════════════════════════════════════════════════════════
 
     async def _fetch_json(self, path: str) -> dict:
         url = f"{API_BASE}{path}"
@@ -43,8 +153,6 @@ class DubheNexusAviationPlugin(Star):
             resp = await client.get(url)
             resp.raise_for_status()
             return resp.json()
-
-    # ── 参数解析 ─────────────────────────────────────────
 
     @staticmethod
     def _parse_text(event: AstrMessageEvent) -> tuple[str, str]:
@@ -59,7 +167,9 @@ class DubheNexusAviationPlugin(Star):
             return routable[0]
         return candidates[0] if candidates else None
 
-    # ── 指令处理器 ───────────────────────────────────────
+    # ══════════════════════════════════════════════════════════
+    # 3. 航空数据指令：/airport /metar /taf /atis /notam /weather
+    # ══════════════════════════════════════════════════════════
 
     @filter.command("airport")
     async def _airport(self, event: AstrMessageEvent):
@@ -74,7 +184,7 @@ class DubheNexusAviationPlugin(Star):
                 yield event.plain_result(self._fmt_airport(data))
             except Exception as e:
                 logger.error(f"机场查询失败 {icao}: {e}")
-                yield event.plain_result(f"❌ 查询机场信息失败: {e}")
+                yield event.plain_result(f"查询机场信息失败: {e}")
         event.should_call_llm(False)
         event.stop_event()
 
@@ -92,7 +202,7 @@ class DubheNexusAviationPlugin(Star):
                 yield event.plain_result(raw or json.dumps(data, ensure_ascii=False))
             except Exception as e:
                 logger.error(f"METAR 查询失败 {icao}: {e}")
-                yield event.plain_result(f"❌ 查询 METAR 失败: {e}")
+                yield event.plain_result(f"查询 METAR 失败: {e}")
         event.should_call_llm(False)
         event.stop_event()
 
@@ -110,7 +220,7 @@ class DubheNexusAviationPlugin(Star):
                 yield event.plain_result(raw or json.dumps(data, ensure_ascii=False))
             except Exception as e:
                 logger.error(f"TAF 查询失败 {icao}: {e}")
-                yield event.plain_result(f"❌ 查询 TAF 失败: {e}")
+                yield event.plain_result(f"查询 TAF 失败: {e}")
         event.should_call_llm(False)
         event.stop_event()
 
@@ -122,7 +232,7 @@ class DubheNexusAviationPlugin(Star):
             yield event.plain_result(formatted or "暂无 VHHH ATIS 数据")
         except Exception as e:
             logger.error(f"ATIS 查询失败: {e}")
-            yield event.plain_result(f"❌ 查询 ATIS 失败: {e}")
+            yield event.plain_result(f"查询 ATIS 失败: {e}")
         event.should_call_llm(False)
         event.stop_event()
 
@@ -134,7 +244,7 @@ class DubheNexusAviationPlugin(Star):
             yield event.plain_result(formatted or "暂无 VHHH NOTAM 数据")
         except Exception as e:
             logger.error(f"NOTAM 查询失败: {e}")
-            yield event.plain_result(f"❌ 查询 NOTAM 失败: {e}")
+            yield event.plain_result(f"查询 NOTAM 失败: {e}")
         event.should_call_llm(False)
         event.stop_event()
 
@@ -150,7 +260,7 @@ class DubheNexusAviationPlugin(Star):
             ), await self._fetch_json(f"/airport/taf/{icao}")
         except Exception as e:
             logger.error(f"气象查询失败 {icao}: {e}")
-            yield event.plain_result(f"❌ 查询气象数据失败: {e}")
+            yield event.plain_result(f"查询气象数据失败: {e}")
             event.should_call_llm(False)
             event.stop_event()
             return
@@ -184,7 +294,9 @@ class DubheNexusAviationPlugin(Star):
         event.should_call_llm(False)
         event.stop_event()
 
-    # ── 自然语言查询 ─────────────────────────────────────
+    # ══════════════════════════════════════════════════════════
+    # 4. 自然语言航空查询
+    # ══════════════════════════════════════════════════════════
 
     @filter.event_message_type(
         filter.EventMessageType.GROUP_MESSAGE
@@ -230,7 +342,7 @@ class DubheNexusAviationPlugin(Star):
             else:
                 data = await self._fetch_json(f"/airport/metar/{icao}")
                 raw = self._decode_metar(data)
-                label, hint = "METAR", "实时观测"
+                label, hint = "METAR", "实时天气"
 
             if not raw:
                 return
@@ -241,7 +353,7 @@ class DubheNexusAviationPlugin(Star):
                     f"=== {icao} {label} ===\n{raw}"
                 ),
                 system_prompt=(
-                    "你是一个航空数据助手。用户查询了航空气象/情报信息，"
+                    "用户查询了航空气象/情报信息，"
                     "以下是实时API返回的数据。请用自然语言清晰地向用户解释这些数据，"
                     "包括关键的天气条件、风力、能见度、云层情况以及飞行注意事项。"
                     "请把天气现象代码翻译成中文。回复简洁明了，控制在300字以内。"
@@ -251,8 +363,6 @@ class DubheNexusAviationPlugin(Star):
             event.stop_event()
         except Exception as e:
             logger.error(f"自然语言查询处理失败: {e}")
-
-    # ── 气象数据聚合 ─────────────────────────────────────
 
     async def _fetch_combined_weather(self, icao: str) -> str:
         lines = []
@@ -270,7 +380,224 @@ class DubheNexusAviationPlugin(Star):
 
         return "\n\n".join(lines)
 
-    # ── 气象解码 ─────────────────────────────────────────
+    # ══════════════════════════════════════════════════════════
+    # 5. /flight 指令
+    # ══════════════════════════════════════════════════════════
+
+    @filter.command("flight")
+    async def _flight(self, event: AstrMessageEvent):
+        text, _ = self._parse_text(event)
+        parts = text.split()
+
+        if len(parts) < 2:
+            yield event.plain_result(
+                "用法：\n"
+                "/flight <平台>              查看所有在线机组\n"
+                "/flight <平台> <呼号>        查找特定机组\n\n"
+                "支持平台：ISFP、SkyLite\n"
+                "例如：/flight ISFP\n"
+                "例如：/flight ISFP CSN1025"
+            )
+            event.should_call_llm(False)
+            event.stop_event()
+            return
+
+        platform = parts[1].lower()
+        if platform not in COMMAND_PLATFORMS:
+            yield event.plain_result(f"不支持的平台「{platform}」，当前仅支持 ISFP 和 SkyLite。")
+            event.should_call_llm(False)
+            event.stop_event()
+            return
+
+        callsign = parts[2].upper() if len(parts) >= 3 else None
+
+        try:
+            raw_data = await self._fetch_json(f"/flights/{platform}")
+        except Exception as e:
+            logger.error(f"航班查询失败 platform={platform}: {e}")
+            yield event.plain_result(f"查询在线机组失败：{e}")
+            event.should_call_llm(False)
+            event.stop_event()
+            return
+
+        clients = self._extract_clients(raw_data, platform)
+        if not clients:
+            yield event.plain_result(f"当前 {platform.upper()} 暂无在线机组。")
+            event.should_call_llm(False)
+            event.stop_event()
+            return
+
+        if callsign:
+            matched = self._match_clients(clients, callsign)
+            if not matched:
+                yield event.plain_result(f"未找到呼号为「{callsign}」的在线机组。")
+                event.should_call_llm(False)
+                event.stop_event()
+                return
+
+            if len(matched) == 1:
+                result = self._fmt_flight_detail(matched[0], platform)
+            else:
+                result = self._fmt_flight_list(matched, platform)
+
+            yield event.plain_result(result)
+        else:
+            total = len(clients)
+            max_show = 40
+            shown = clients[:max_show]
+            result = self._fmt_flight_list(shown, platform)
+            if total > max_show:
+                result += (
+                    f"\n\n（当前共 {total} 个在线机组，仅展示前 {max_show} 个。"
+                    f"使用 /flight {platform} <呼号> 查找特定机组）"
+                )
+            yield event.plain_result(result)
+
+        event.should_call_llm(False)
+        event.stop_event()
+
+    # ══════════════════════════════════════════════════════════
+    # 6. 航班数据解析
+    # ══════════════════════════════════════════════════════════
+
+    @staticmethod
+    def _extract_clients(data: dict | list, platform: str) -> list[dict]:
+        if isinstance(data, list):
+            return data
+        if not isinstance(data, dict):
+            return []
+
+        if platform == "skylite":
+            pilots = data.get("pilots") or data.get("clients") or []
+            return pilots if isinstance(pilots, list) else []
+
+        for key in ("clients", "pilots", "flights", "data"):
+            val = data.get(key)
+            if isinstance(val, list):
+                return val
+        return []
+
+    @staticmethod
+    def _match_clients(clients: list[dict], callsign: str) -> list[dict]:
+        cs_upper = callsign.upper()
+        exact = [c for c in clients if (c.get("callsign") or "").upper() == cs_upper]
+        if exact:
+            return exact
+        return [c for c in clients if cs_upper in (c.get("callsign") or "").upper()]
+
+    @staticmethod
+    def _fmt_flight_list(clients: list[dict], platform: str) -> str:
+        label = {"isfp": "ISFP", "skylite": "SkyLite"}.get(platform, platform.upper())
+        lines = [f"{label} 在线机组", ""]
+        for c in clients:
+            cs = c.get("callsign") or "?"
+            dep, arr = DubheNexusServicesPlugin._get_route(c, platform)
+            route = f"{dep} → {arr}" if dep and arr else (dep or arr or "")
+            line = cs
+            if route:
+                line += f"  {route}"
+            lines.append(line)
+        return "\n".join(lines)
+
+    @staticmethod
+    def _fmt_flight_detail(client: dict, platform: str) -> str:
+        cs = client.get("callsign") or "?"
+        name = (client.get("name") or client.get("sender_name")
+                or client.get("pilot_name") or "")
+        dep, arr = DubheNexusServicesPlugin._get_route(client, platform)
+        lat = client.get("latitude") or client.get("lat")
+        lon = client.get("longitude") or client.get("lon") or client.get("lng")
+        alt = client.get("altitude") or client.get("alt")
+        gs = client.get("groundspeed") or client.get("gs") or client.get("speed")
+        hdg = client.get("heading") or client.get("hdg")
+        sq = client.get("squawk_code") or client.get("squawk") or client.get("transponder") or ""
+        cru_alt = client.get("cruise_altitude") or client.get("cruise_alt")
+        cru_tas = client.get("cruise_tas") or client.get("cruise_speed")
+        route = client.get("route") or client.get("flight_plan_route") or ""
+
+        fp = client.get("flight_plan")
+        if isinstance(fp, dict):
+            if not cru_alt:
+                cru_alt = fp.get("altitude")
+            if not cru_tas:
+                cru_tas = fp.get("cruise_tas")
+            if not route:
+                route = fp.get("route")
+
+        lines = [cs]
+        if name:
+            lines.append(name)
+        if dep or arr:
+            lines.append(f"{dep or '?'} → {arr or '?'}")
+        if lat is not None and lon is not None:
+            try:
+                lat_f = float(lat)
+                lon_f = float(lon)
+                lat_dir = "N" if lat_f >= 0 else "S"
+                lon_dir = "E" if lon_f >= 0 else "W"
+                lines.append(f"{abs(lat_f):.4f}°{lat_dir}  {abs(lon_f):.4f}°{lon_dir}")
+            except (ValueError, TypeError):
+                lines.append(f"{lat}  {lon}")
+
+        status_parts = []
+        if alt is not None and str(alt).strip():
+            try:
+                a = int(float(alt))
+                status_parts.append(f"FL{a // 100}" if a > 100 else f"高度 {a} ft")
+            except (ValueError, TypeError):
+                status_parts.append(str(alt))
+        if gs is not None and str(gs).strip():
+            try:
+                status_parts.append(f"地速 {int(float(gs))} kt")
+            except (ValueError, TypeError):
+                status_parts.append(f"{gs}")
+        if hdg is not None and str(hdg).strip():
+            try:
+                status_parts.append(f"航向 {int(float(hdg))}°")
+            except (ValueError, TypeError):
+                status_parts.append(f"{hdg}")
+        if status_parts:
+            lines.append("  ".join(status_parts))
+
+        if sq and str(sq).strip():
+            lines.append(f"应答机 {sq}")
+
+        cruise_parts = []
+        if cru_alt is not None and str(cru_alt).strip():
+            try:
+                ca = int(float(cru_alt))
+                cruise_parts.append(f"巡航高度 FL{ca // 100}" if ca > 100 else f"巡航高度 {ca} ft")
+            except (ValueError, TypeError):
+                cruise_parts.append(f"巡航高度 {cru_alt}")
+        if cru_tas is not None and str(cru_tas).strip():
+            try:
+                cruise_parts.append(f"巡航速度 {int(float(cru_tas))} kt")
+            except (ValueError, TypeError):
+                cruise_parts.append(f"巡航速度 {cru_tas}")
+        if cruise_parts:
+            lines.append("  ".join(cruise_parts))
+
+        if route and str(route).strip():
+            lines.append("申报航线")
+            lines.append(str(route).strip())
+
+        return "\n".join(lines)
+
+    @staticmethod
+    def _get_route(client: dict, platform: str) -> tuple[str, str]:
+        fp = client.get("flight_plan")
+        if isinstance(fp, dict):
+            dep = fp.get("departure") or ""
+            arr = fp.get("arrival") or ""
+            return dep, arr
+
+        dep = client.get("departure_icao") or client.get("departure") or client.get("dep") or ""
+        arr = client.get("arrival_icao") or client.get("arrival") or client.get("arr") or ""
+        return dep, arr
+
+    # ══════════════════════════════════════════════════════════
+    # 7. 气象解码 & 格式化
+    # ══════════════════════════════════════════════════════════
 
     cloud_cover = {
         "SKC": "晴空", "CLR": "晴朗", "FEW": "疏云",
@@ -319,7 +646,6 @@ class DubheNexusAviationPlugin(Star):
         if raw:
             lines.append(f"原始报文: {raw}")
         if metar.get("obsTime"):
-            from datetime import datetime, timezone
             ts = metar["obsTime"]
             dt = datetime.fromtimestamp(ts, tz=timezone.utc)
             lines.append(f"观测时间: {dt.strftime('%Y-%m-%d %H:%M UTC')}")
@@ -379,7 +705,6 @@ class DubheNexusAviationPlugin(Star):
         fcsts = taf.get("fcsts")
         if isinstance(fcsts, list):
             lines.append("\n分段预报:")
-            from datetime import datetime, timezone
             for fc in fcsts:
                 change = fc.get("fcstChange") or "BASE"
                 label = {
@@ -422,8 +747,6 @@ class DubheNexusAviationPlugin(Star):
 
         return "\n".join(lines)
 
-    # ── 原始报文提取 ─────────────────────────────────────
-
     @staticmethod
     def _raw_metar(data: dict) -> str:
         metar = data.get("metar")
@@ -438,8 +761,6 @@ class DubheNexusAviationPlugin(Star):
             return taf.get("rawTAF", "")
         return ""
 
-    # ── 格式化工具 ────────────────────────────────────────
-
     @staticmethod
     def _fmt_airport(data: dict) -> str:
         raw = data.get("data")
@@ -450,7 +771,7 @@ class DubheNexusAviationPlugin(Star):
         name = raw.get("name", "N/A")
         if raw.get("iataId"):
             name += f" ({raw['iataId']})"
-        lines.append(f"📍 {name}")
+        lines.append(f"{name}")
 
         loc_parts = [p for p in [raw.get("state"), raw.get("country")] if p]
         loc = raw.get("icaoId", "N/A")
@@ -474,7 +795,7 @@ class DubheNexusAviationPlugin(Star):
         if raw.get("runways"):
             for r in raw["runways"]:
                 rwy_line += (
-                    f"\n  {r['id']} ({r['lengthM']}m × {r['widthM']}m, {r['surface']})"
+                    f"\n  {r['id']} ({r['lengthM']}m x {r['widthM']}m, {r['surface']})"
                 )
         lines.append(rwy_line)
 
@@ -491,7 +812,7 @@ class DubheNexusAviationPlugin(Star):
         for key in ("arrival", "departure"):
             info = data.get(key)
             if isinstance(info, dict) and info.get("raw"):
-                label = "进港" if key == "arrival" else "离港"
+                label = "进近" if key == "arrival" else "离场"
                 lines.append(f"=== {label} ATIS ===\n{info['raw']}")
         return "\n\n".join(lines)
 
@@ -505,3 +826,10 @@ class DubheNexusAviationPlugin(Star):
                     lines.append(f"=== NOTAM #{i} ===\n{n['content']}")
             return "\n\n".join(lines) if lines else ""
         return ""
+
+    # ══════════════════════════════════════════════════════════
+    # 8. 卸载
+    # ══════════════════════════════════════════════════════════
+
+    async def terminate(self):
+        logger.info("Dubhe Nexus Services 插件已卸载")
