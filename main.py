@@ -95,6 +95,34 @@ https://www.dubhenexus.org
 - dev@dubhenexus.org       开发组（非严重或特殊情况下不要主动联系）
 - collab@dubhenexus.org    合作洽谈
 
+### 数据 API（data.dubhenexus.org）
+
+所有航空数据统一从 Dubhe Nexus 后端 API 获取，调用方式：
+
+```
+curl -s "https://data.dubhenexus.org/api/{path}"
+```
+
+可用接口一览：
+
+| 接口路径 | 说明 | 备注 |
+|----------|------|------|
+| `/airport/:icao` | 机场基础信息（名称、跑道、坐标等） | |
+| `/airport/metar/:icao` | METAR 实时观测气象 | |
+| `/airport/taf/:icao` | TAF 航站预报 | |
+| `/airport/atis/:icao` | ATIS 通播 | 仅 VHHH |
+| `/airport/notam/:icao` | NOTAM 航行通告 | 仅 VHHH |
+| `/flights/isfp` | ISFP 在线机组 | |
+| `/flights/skylite` | SkyLite 在线机组 | |
+
+用法示例：
+- `curl -s "https://data.dubhenexus.org/api/airport/metar/VHHH"
+-  `curl -s "https://data.dubhenexus.org/api/flights/isfp"
+-  `curl -s "https://data.dubhenexus.org/api/airport/VHHH"
+
+**严禁使用 aviationweather.gov、isfpapi.flyisfp.com 等外部 API**，全部通过 Dubhe Nexus 代理。
+ATIS/NOTAM 仅 VHHH 有接口，数据可能为空是正常的，直接告知用户即可，不要尝试其他途径获取。
+
 ### 行为准则
 
 1. 你是天枢互联 Dubhe Nexus 的航空助手，具备专业的航空数据查询与解读能力。
@@ -132,13 +160,20 @@ class DubheNexusServicesPlugin(Star):
         super().__init__(context)
 
     # ══════════════════════════════════════════════════════════
-    # 1. LLM 知识注入
+    # 1. LLM 知识注入 & 航空数据恢复
     # ══════════════════════════════════════════════════════════
 
-    @filter.on_llm_request()
+    @filter.on_llm_request(priority=100)
     async def inject_services_knowledge(self, event: AstrMessageEvent, req):
+        # 知识注入
         if DUBHE_NEXUS_KNOWLEDGE not in req.system_prompt:
             req.system_prompt += "\n\n" + DUBHE_NEXUS_KNOWLEDGE
+
+        # 恢复自然语言查询注入的航空数据（被 AngelHeart prompt 重写覆盖后恢复）
+        aviation_data = getattr(event, "_dubhe_aviation_prompt", None)
+        if aviation_data:
+            req.prompt = aviation_data
+            logger.info("已恢复航空查询数据到 LLM 请求")
 
     # ══════════════════════════════════════════════════════════
     # 2. API 通用方法
@@ -291,6 +326,7 @@ class DubheNexusServicesPlugin(Star):
                 "并说明是否对飞行有影响。回复应简洁清晰，控制在300字以内。"
             ),
         )
+        event._dubhe_aviation_prompt = prompt
         event.should_call_llm(False)
         event.stop_event()
 
@@ -302,7 +338,7 @@ class DubheNexusServicesPlugin(Star):
         filter.EventMessageType.GROUP_MESSAGE
         | filter.EventMessageType.PRIVATE_MESSAGE
         | filter.EventMessageType.FRIEND_MESSAGE,
-        priority=60,
+        priority=-20,
     )
     async def _handle_natural_query(self, event: AstrMessageEvent):
         text, text_lower = self._parse_text(event)
@@ -314,6 +350,12 @@ class DubheNexusServicesPlugin(Star):
             return
 
         icao = self._extract_icao(text)
+
+        # ATIS / NOTAM 没有 ICAO 时默认 VHHH（仅 VHHH 有数据源）
+        needs_vhhh_only = any(kw in text_lower for kw in ("atis", "notam"))
+        if not icao and needs_vhhh_only:
+            icao = "VHHH"
+
         if not icao:
             return
 
@@ -324,10 +366,20 @@ class DubheNexusServicesPlugin(Star):
                 data = await self._fetch_json(f"/airport/notam/{icao}")
                 raw = self._fmt_notam(data)
                 label, hint = "NOTAM", "航行通告"
+                if not raw:
+                    yield event.plain_result(f"暂无 {icao} 的 NOTAM 数据。目前 NOTAM 仅支持 VHHH。")
+                    event.should_call_llm(False)
+                    event.stop_event()
+                    return
             elif "atis" in text_lower:
                 data = await self._fetch_json(f"/airport/atis/{icao}")
                 raw = self._fmt_atis(data)
                 label, hint = "ATIS", "自动终端信息"
+                if not raw:
+                    yield event.plain_result(f"暂无 {icao} 的 ATIS 数据。目前 ATIS 仅支持 VHHH。")
+                    event.should_call_llm(False)
+                    event.stop_event()
+                    return
             elif "taf" in text_lower:
                 data = await self._fetch_json(f"/airport/taf/{icao}")
                 raw = self._decode_taf(data)
@@ -358,6 +410,10 @@ class DubheNexusServicesPlugin(Star):
                     "包括关键的天气条件、风力、能见度、云层情况以及飞行注意事项。"
                     "请把天气现象代码翻译成中文。回复简洁明了，控制在300字以内。"
                 ),
+            )
+            event._dubhe_aviation_prompt = (
+                f"用户查询了 {icao} 的{hint}，以下是实时数据：\n\n"
+                f"=== {icao} {label} ===\n{raw}"
             )
             event.should_call_llm(False)
             event.stop_event()
