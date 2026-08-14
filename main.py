@@ -8,6 +8,8 @@ import httpx
 from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.star import Context, Star, register
 from astrbot.api import logger
+from astrbot.core.star.filter.command import CommandFilter
+from astrbot.core.star.filter.command_group import CommandGroupFilter
 
 API_BASE = "https://data.dubhenexus.org/api"
 
@@ -180,22 +182,59 @@ ATIS/NOTAM 仅 VHHH 有接口，数据可能为空是正常的，直接告知用
 class DubheNexusServicesPlugin(Star):
     def __init__(self, context: Context, config=None):
         super().__init__(context)
+        self.config = config
+
+    # ══════════════════════════════════════════════════════════
+    # 0. 配置
+    # ══════════════════════════════════════════════════════════
+
+    def _use_llm(self) -> bool:
+        """查询结果是否通过 LLM 解读后回复；关闭则直接输出数据。"""
+        if self.config is None:
+            return True
+        return bool(self.config.get("use_llm_reply", True))
+
+    def _allowed(self, event: AstrMessageEvent) -> bool:
+        """会话白名单检查：群聊按群号、私聊按发送者 QQ 号匹配。"""
+        if self.config is None:
+            return True
+        if not self.config.get("whitelist_enabled", False):
+            return True
+        whitelist = [
+            str(x).strip()
+            for x in (self.config.get("whitelist") or [])
+            if str(x).strip()
+        ]
+        if not whitelist:
+            return True
+        gid = str(event.get_group_id() or "")
+        uid = str(event.get_sender_id() or "")
+        return gid in whitelist or uid in whitelist
 
     # ══════════════════════════════════════════════════════════
     # 1. LLM 知识注入 & 航空数据恢复
     # ══════════════════════════════════════════════════════════
 
-    @filter.on_llm_request(priority=100)
+    # 注意：钩子按 priority 降序执行，AngelHeart 的请求体重写(priority=50)会在
+    # priority=100 的钩子之后运行。因此恢复逻辑必须用极低的优先级，确保在
+    # 所有重写钩子之后执行，否则实时数据会被群聊上下文接管插件覆盖回缓存数据。
+    @filter.on_llm_request(priority=-1000)
     async def inject_services_knowledge(self, event: AstrMessageEvent, req):
         # 知识注入
         if DUBHE_NEXUS_KNOWLEDGE not in req.system_prompt:
             req.system_prompt += "\n\n" + DUBHE_NEXUS_KNOWLEDGE
 
-        # 恢复自然语言查询注入的航空数据（被 AngelHeart prompt 重写覆盖后恢复）
-        aviation_data = getattr(event, "_dubhe_aviation_prompt", None)
-        if aviation_data:
-            req.prompt = aviation_data
-            logger.info("已恢复航空查询数据到 LLM 请求")
+        # 恢复航空查询注入的实时数据。
+        # 标记挂在 req 对象上且在 yield 之前设置（event 属性要等整个 LLM 请求
+        # 完成后才会被赋值，时序上无法被钩子读到）。
+        original_prompt = getattr(req, "_dubhe_original_prompt", None)
+        if original_prompt:
+            if req.prompt != original_prompt:
+                logger.info("检测到航空查询实时数据被其他插件覆盖，已恢复")
+                req.prompt = original_prompt
+            # 本请求为独立的数据解读请求，清空被替换进来的会话历史，
+            # 避免模型混用历史中的旧航空数据。
+            req.contexts = []
 
     # ══════════════════════════════════════════════════════════
     # 2. API 通用方法
@@ -230,6 +269,8 @@ class DubheNexusServicesPlugin(Star):
 
     @filter.command("airport")
     async def _airport(self, event: AstrMessageEvent):
+        if not self._allowed(event):
+            return
         text, _ = self._parse_text(event)
         args = text.split()
         if len(args) < 2:
@@ -247,6 +288,8 @@ class DubheNexusServicesPlugin(Star):
 
     @filter.command("metar")
     async def _metar(self, event: AstrMessageEvent):
+        if not self._allowed(event):
+            return
         text, _ = self._parse_text(event)
         args = text.split()
         if len(args) < 2:
@@ -265,6 +308,8 @@ class DubheNexusServicesPlugin(Star):
 
     @filter.command("taf")
     async def _taf(self, event: AstrMessageEvent):
+        if not self._allowed(event):
+            return
         text, _ = self._parse_text(event)
         args = text.split()
         if len(args) < 2:
@@ -295,6 +340,8 @@ class DubheNexusServicesPlugin(Star):
 
     @filter.command("notam")
     async def _notam(self, event: AstrMessageEvent):
+        if not self._allowed(event):
+            return
         try:
             data = await self._fetch_json("/airport/notam/VHHH")
             formatted = self._fmt_notam(data)
@@ -324,6 +371,19 @@ class DubheNexusServicesPlugin(Star):
 
         metar_raw = self._raw_metar(metar_data)
         taf_raw = self._raw_taf(taf_data)
+
+        # 直出模式：不经 LLM，直接输出原始报文
+        if not self._use_llm():
+            parts = []
+            if metar_raw:
+                parts.append(f"METAR {metar_raw}")
+            if taf_raw:
+                parts.append(f"TAF {taf_raw}")
+            yield event.plain_result("\n\n".join(parts) or f"暂无 {icao} 气象数据")
+            event.should_call_llm(False)
+            event.stop_event()
+            return
+
         metar_decoded = self._decode_metar(metar_data)
         taf_decoded = self._decode_taf(taf_data)
 
@@ -339,7 +399,7 @@ class DubheNexusServicesPlugin(Star):
         if taf_raw:
             prompt += f"\n=== TAF 原始报文 ===\n{taf_raw}\n"
 
-        yield event.request_llm(
+        llm_req = event.request_llm(
             prompt=prompt,
             system_prompt=(
                 "你是一个专业的航空天气助手。请基于提供的实时气象数据，"
@@ -348,7 +408,8 @@ class DubheNexusServicesPlugin(Star):
                 "并说明是否对飞行有影响。回复应简洁清晰，控制在300字以内。"
             ),
         )
-        event._dubhe_aviation_prompt = prompt
+        llm_req._dubhe_original_prompt = prompt
+        yield llm_req
         event.should_call_llm(False)
         event.stop_event()
 
@@ -363,9 +424,19 @@ class DubheNexusServicesPlugin(Star):
         priority=-20,
     )
     async def _handle_natural_query(self, event: AstrMessageEvent):
+        if not self._allowed(event):
+            return
         text, text_lower = self._parse_text(event)
         if not text or text.startswith("/"):
             return
+
+        # 唤醒前缀已被 WakingCheckStage 剥离，无法通过 text.startswith("/") 判断指令
+        # 检查是否有指令处理器被激活，避免与指令处理器重复处理
+        activated_handlers = event.get_extra("activated_handlers", []) or []
+        for handler in activated_handlers:
+            for f in getattr(handler, "event_filters", []) or []:
+                if isinstance(f, (CommandFilter, CommandGroupFilter)):
+                    return
 
         matched = [kw for kw in AVIATION_KEYWORDS if kw in text_lower]
         if not matched:
@@ -382,6 +453,7 @@ class DubheNexusServicesPlugin(Star):
             return
 
         logger.info(f"自然语言航空查询: keywords={matched}, icao={icao}")
+        direct = not self._use_llm()
 
         try:
             if "notam" in text_lower:
@@ -404,10 +476,13 @@ class DubheNexusServicesPlugin(Star):
                     return
             elif "taf" in text_lower:
                 data = await self._fetch_json(f"/airport/taf/{icao}")
-                raw = self._decode_taf(data)
+                raw = self._raw_taf(data) if direct else self._decode_taf(data)
                 label, hint = "TAF", "天气预报"
             elif any(kw in text_lower for kw in ("气象", "天气", "weather")):
-                raw = await self._fetch_combined_weather(icao)
+                if direct:
+                    raw = await self._fetch_raw_weather(icao)
+                else:
+                    raw = await self._fetch_combined_weather(icao)
                 label, hint = "气象", "天气报告"
             elif any(kw in text_lower for kw in ("机场", "airport", "跑道", "runway")):
                 data = await self._fetch_json(f"/airport/{icao}")
@@ -415,13 +490,20 @@ class DubheNexusServicesPlugin(Star):
                 label, hint = "机场", "机场信息"
             else:
                 data = await self._fetch_json(f"/airport/metar/{icao}")
-                raw = self._decode_metar(data)
+                raw = self._raw_metar(data) if direct else self._decode_metar(data)
                 label, hint = "METAR", "实时天气"
 
             if not raw:
                 return
 
-            yield event.request_llm(
+            # 直出模式：不经 LLM，直接输出数据
+            if direct:
+                yield event.plain_result(f"【{icao} {label}】\n{raw}")
+                event.should_call_llm(False)
+                event.stop_event()
+                return
+
+            llm_req = event.request_llm(
                 prompt=(
                     f"用户查询了 {icao} 的{hint}，以下是实时数据：\n\n"
                     f"=== {icao} {label} ===\n{raw}"
@@ -433,14 +515,31 @@ class DubheNexusServicesPlugin(Star):
                     "请把天气现象代码翻译成中文。回复简洁明了，控制在300字以内。"
                 ),
             )
-            event._dubhe_aviation_prompt = (
-                f"用户查询了 {icao} 的{hint}，以下是实时数据：\n\n"
-                f"=== {icao} {label} ===\n{raw}"
-            )
+            llm_req._dubhe_original_prompt = llm_req.prompt
+            yield llm_req
             event.should_call_llm(False)
             event.stop_event()
         except Exception as e:
             logger.error(f"自然语言查询处理失败: {e}")
+
+    async def _fetch_raw_weather(self, icao: str) -> str:
+        """直出模式：获取 METAR/TAF 原始报文"""
+        parts = []
+        try:
+            metar_raw = self._raw_metar(await self._fetch_json(f"/airport/metar/{icao}"))
+            if metar_raw:
+                parts.append(f"METAR {metar_raw}")
+        except Exception as e:
+            parts.append(f"METAR 获取失败: {e}")
+
+        try:
+            taf_raw = self._raw_taf(await self._fetch_json(f"/airport/taf/{icao}"))
+            if taf_raw:
+                parts.append(f"TAF {taf_raw}")
+        except Exception as e:
+            parts.append(f"TAF 获取失败: {e}")
+
+        return "\n\n".join(parts)
 
     async def _fetch_combined_weather(self, icao: str) -> str:
         lines = []
@@ -464,6 +563,8 @@ class DubheNexusServicesPlugin(Star):
 
     @filter.command("flight")
     async def _flight(self, event: AstrMessageEvent):
+        if not self._allowed(event):
+            return
         text, _ = self._parse_text(event)
         parts = text.split()
 
@@ -500,7 +601,8 @@ class DubheNexusServicesPlugin(Star):
 
         clients = self._extract_clients(raw_data, platform)
         if not clients:
-            yield event.plain_result(f"当前 {platform.upper()} 暂无在线机组。")
+            label = {"isfp": "ISFP", "skylite": "SkyLite"}.get(platform, platform.upper())
+            yield event.plain_result(f"【{label}】\n在线机组：\n无人在线")
             event.should_call_llm(False)
             event.stop_event()
             return
@@ -566,7 +668,7 @@ class DubheNexusServicesPlugin(Star):
     @staticmethod
     def _fmt_flight_list(clients: list[dict], platform: str) -> str:
         label = {"isfp": "ISFP", "skylite": "SkyLite"}.get(platform, platform.upper())
-        lines = [f"{label} 在线机组", ""]
+        lines = [f"【{label}】", "在线机组："]
         for c in clients:
             cs = c.get("callsign") or "?"
             dep, arr = DubheNexusServicesPlugin._get_route(c, platform)

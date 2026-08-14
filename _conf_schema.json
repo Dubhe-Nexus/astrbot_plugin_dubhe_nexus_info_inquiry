@@ -1,0 +1,21 @@
+{
+  "whitelist_enabled": {
+    "type": "bool",
+    "description": "启用会话白名单",
+    "hint": "启用后，仅白名单内的群聊/私聊可以使用本插件的查询功能（指令与自然语言查询均受限）。白名单为空时视为不限制。",
+    "default": false
+  },
+  "whitelist": {
+    "type": "list",
+    "description": "白名单列表",
+    "hint": "允许使用查询功能的群号或用户 QQ 号，每行一个，如 123456789。群聊按群号匹配，私聊按发送者 QQ 号匹配。",
+    "items": { "type": "string" },
+    "default": []
+  },
+  "use_llm_reply": {
+    "type": "bool",
+    "description": "查询结果通过 LLM 解读后回复",
+    "hint": "开启：气象等查询结果交由 LLM 用自然语言解读（可能受其他插件改写影响）。关闭：直接输出原始报文/格式化数据，速度快、不消耗 token。",
+    "default": true
+  }
+}
