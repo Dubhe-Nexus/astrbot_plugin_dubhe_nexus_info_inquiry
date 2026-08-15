@@ -177,16 +177,12 @@ ATIS/NOTAM 仅 VHHH 有接口，数据可能为空是正常的，直接告知用
     "Dubhe Nexus Innovation and Research Studio",
     "天枢互联服务集成：航空数据查询（METAR/TAF/ATIS/NOTAM/机场/气象）、"
     "在线机组查询（ISFP/SkyLite）、EFB 航图链接引导、知识注入",
-    "2.0.0",
+    "2.2.0",
 )
 class DubheNexusServicesPlugin(Star):
     def __init__(self, context: Context, config=None):
         super().__init__(context)
         self.config = config
-
-    # ══════════════════════════════════════════════════════════
-    # 0. 配置
-    # ══════════════════════════════════════════════════════════
 
     def _use_llm(self) -> bool:
         """查询结果是否通过 LLM 解读后回复；关闭则直接输出数据。"""
@@ -211,34 +207,18 @@ class DubheNexusServicesPlugin(Star):
         uid = str(event.get_sender_id() or "")
         return gid in whitelist or uid in whitelist
 
-    # ══════════════════════════════════════════════════════════
-    # 1. LLM 知识注入 & 航空数据恢复
-    # ══════════════════════════════════════════════════════════
-
-    # 注意：钩子按 priority 降序执行，AngelHeart 的请求体重写(priority=50)会在
-    # priority=100 的钩子之后运行。因此恢复逻辑必须用极低的优先级，确保在
-    # 所有重写钩子之后执行，否则实时数据会被群聊上下文接管插件覆盖回缓存数据。
     @filter.on_llm_request(priority=-1000)
     async def inject_services_knowledge(self, event: AstrMessageEvent, req):
         # 知识注入
         if DUBHE_NEXUS_KNOWLEDGE not in req.system_prompt:
             req.system_prompt += "\n\n" + DUBHE_NEXUS_KNOWLEDGE
 
-        # 恢复航空查询注入的实时数据。
-        # 标记挂在 req 对象上且在 yield 之前设置（event 属性要等整个 LLM 请求
-        # 完成后才会被赋值，时序上无法被钩子读到）。
         original_prompt = getattr(req, "_dubhe_original_prompt", None)
         if original_prompt:
             if req.prompt != original_prompt:
                 logger.info("检测到航空查询实时数据被其他插件覆盖，已恢复")
                 req.prompt = original_prompt
-            # 本请求为独立的数据解读请求，清空被替换进来的会话历史，
-            # 避免模型混用历史中的旧航空数据。
             req.contexts = []
-
-    # ══════════════════════════════════════════════════════════
-    # 2. API 通用方法
-    # ══════════════════════════════════════════════════════════
 
     async def _fetch_json(self, path: str) -> dict:
         url = f"{API_BASE}{path}"
@@ -262,10 +242,6 @@ class DubheNexusServicesPlugin(Star):
         if routable:
             return routable[0]
         return candidates[0] if candidates else None
-
-    # ══════════════════════════════════════════════════════════
-    # 3. 航空数据指令：/airport /metar /taf /atis /notam /weather
-    # ══════════════════════════════════════════════════════════
 
     @filter.command("airport")
     async def _airport(self, event: AstrMessageEvent):
@@ -372,7 +348,6 @@ class DubheNexusServicesPlugin(Star):
         metar_raw = self._raw_metar(metar_data)
         taf_raw = self._raw_taf(taf_data)
 
-        # 直出模式：不经 LLM，直接输出原始报文
         if not self._use_llm():
             parts = []
             if metar_raw:
@@ -413,10 +388,6 @@ class DubheNexusServicesPlugin(Star):
         event.should_call_llm(False)
         event.stop_event()
 
-    # ══════════════════════════════════════════════════════════
-    # 4. 自然语言航空查询
-    # ══════════════════════════════════════════════════════════
-
     @filter.event_message_type(
         filter.EventMessageType.GROUP_MESSAGE
         | filter.EventMessageType.PRIVATE_MESSAGE
@@ -430,8 +401,6 @@ class DubheNexusServicesPlugin(Star):
         if not text or text.startswith("/"):
             return
 
-        # 唤醒前缀已被 WakingCheckStage 剥离，无法通过 text.startswith("/") 判断指令
-        # 检查是否有指令处理器被激活，避免与指令处理器重复处理
         activated_handlers = event.get_extra("activated_handlers", []) or []
         for handler in activated_handlers:
             for f in getattr(handler, "event_filters", []) or []:
@@ -444,7 +413,6 @@ class DubheNexusServicesPlugin(Star):
 
         icao = self._extract_icao(text)
 
-        # ATIS / NOTAM 没有 ICAO 时默认 VHHH（仅 VHHH 有数据源）
         needs_vhhh_only = any(kw in text_lower for kw in ("atis", "notam"))
         if not icao and needs_vhhh_only:
             icao = "VHHH"
@@ -496,7 +464,6 @@ class DubheNexusServicesPlugin(Star):
             if not raw:
                 return
 
-            # 直出模式：不经 LLM，直接输出数据
             if direct:
                 yield event.plain_result(f"【{icao} {label}】\n{raw}")
                 event.should_call_llm(False)
@@ -556,10 +523,6 @@ class DubheNexusServicesPlugin(Star):
             lines.append(f"TAF 获取失败: {e}")
 
         return "\n\n".join(lines)
-
-    # ══════════════════════════════════════════════════════════
-    # 5. /flight 指令
-    # ══════════════════════════════════════════════════════════
 
     @filter.command("flight")
     async def _flight(self, event: AstrMessageEvent):
@@ -635,10 +598,6 @@ class DubheNexusServicesPlugin(Star):
 
         event.should_call_llm(False)
         event.stop_event()
-
-    # ══════════════════════════════════════════════════════════
-    # 6. 航班数据解析
-    # ══════════════════════════════════════════════════════════
 
     @staticmethod
     def _extract_clients(data: dict | list, platform: str) -> list[dict]:
@@ -774,10 +733,6 @@ class DubheNexusServicesPlugin(Star):
         dep = client.get("departure_icao") or client.get("departure") or client.get("dep") or ""
         arr = client.get("arrival_icao") or client.get("arrival") or client.get("arr") or ""
         return dep, arr
-
-    # ══════════════════════════════════════════════════════════
-    # 7. 气象解码 & 格式化
-    # ══════════════════════════════════════════════════════════
 
     cloud_cover = {
         "SKC": "晴空", "CLR": "晴朗", "FEW": "疏云",
@@ -1006,10 +961,6 @@ class DubheNexusServicesPlugin(Star):
                     lines.append(f"=== NOTAM #{i} ===\n{n['content']}")
             return "\n\n".join(lines) if lines else ""
         return ""
-
-    # ══════════════════════════════════════════════════════════
-    # 8. 卸载
-    # ══════════════════════════════════════════════════════════
 
     async def terminate(self):
         logger.info("Dubhe Nexus Services 插件已卸载")
