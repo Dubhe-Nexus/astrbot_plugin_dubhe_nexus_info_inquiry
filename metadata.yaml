@@ -1,6 +1,6 @@
 name: astrbot_plugin_dubhe_nexus_services
 display_name: 天枢互联服务集成
 desc: 天枢互联服务集成：航空数据查询（METAR/TAF/ATIS/NOTAM/机场/气象）、在线机组查询（ISFP/SkyLite）、EFB 航图链接引导
-version: 2.2.0
+version: 2.3.0
 author: Dubhe Nexus Innovation and Research Studio
 repo: https://github.com/Dubhe-Nexus/astrbot_plugin_dubhe_nexus_services

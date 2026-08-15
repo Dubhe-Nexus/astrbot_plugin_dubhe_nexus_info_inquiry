@@ -18,12 +18,25 @@ AVIATION_KEYWORDS = [
     "metar", "taf", "atis", "notam",
     "气象", "天气", "weather", "报文",
     "机场", "airport", "跑道", "runway",
-    "起降", "航空", 
+    "起降", "航空", "航路", "route",
 ]
 
-ICAO_PATTERN = re.compile(r"\b([A-Za-z]{4})\b")
+# 允许 ICAO 紧邻中文字符（如 "VHHH到WSSS"），\b 在 CJK 与字母间不生效，故用断言替代
+ICAO_PATTERN = re.compile(r"(?<![A-Za-z0-9])([A-Za-z]{4})(?![A-Za-z0-9])")
 ROUTABLE_ICAO_PREFIXES = frozenset("VZRPYOBG")
 COMMAND_PLATFORMS = frozenset({"isfp", "skylite"})
+
+# 航路起降场解析时不限定首字母前缀（如 WSSS），仅排除常见英文单词避免误判
+ROUTE_WORD_STOPWORDS = frozenset({
+    "from", "into", "over", "than", "then", "this", "that", "with",
+    "have", "near", "what", "when", "show", "give", "help", "also",
+    "back", "come", "does", "each", "find", "just", "keep", "left",
+    "less", "like", "made", "make", "many", "more", "most", "much",
+    "must", "name", "need", "once", "only", "open", "part", "some",
+    "take", "tell", "them", "they", "time", "turn", "very", "want",
+    "well", "were", "will", "your", "away", "both", "down", "even",
+    "here", "look", "next", "sure", "work", "year",
+})
 
 # ── LLM 注入的知识 ──────────────────────────────────────
 DUBHE_NEXUS_KNOWLEDGE = """
@@ -45,6 +58,7 @@ DUBHE_NEXUS_KNOWLEDGE = """
 - /api/airport/taf/:icao    TAF 航站预报
 - /api/airport/atis/:icao   ATIS 通播（仅支持 VHHH 香港国际机场）
 - /api/airport/notam/:icao  NOTAM 航行通告（仅支持 VHHH 香港国际机场）
+- /api/routes?origin=VHHH&destination=WSSS  航路查询（返回航路串、总距离）
 
 在线航班接口：
 - /api/flights/isfp         ISFP 在线机组
@@ -61,6 +75,7 @@ DUBHE_NEXUS_KNOWLEDGE = """
 - /taf <ICAO>              查询 TAF 航站预报
 - /atis [DEP/ARR] <ICAO>   查询 ATIS 通播（仅 VHHH，可选 DEP/ARR 指定进离场）
 - /notam                   查询 VHHH NOTAM 航行通告
+- /route <出发ICAO> <到达ICAO>  查询两地航路（直接输出航路串与总距离）
 - /weather <ICAO>          综合气象查询（含 METAR + TAF 解读）
 - /flight <ISFP/SkyLite>           查看在线机组列表
 - /flight <ISFP/SkyLite> <呼号>     按呼号查特定机组详细信息
@@ -119,13 +134,15 @@ curl -s "https://data.dubhenexus.org/api/{path}"
 | `/airport/taf/:icao` | TAF 航站预报 | |
 | `/airport/atis/:icao` | ATIS 通播 | 仅 VHHH |
 | `/airport/notam/:icao` | NOTAM 航行通告 | 仅 VHHH |
+| `/routes?origin=:icao&destination=:icao` | 两地航路查询 | 返回航路串与距离 |
 | `/flights/isfp` | ISFP 云际在线机组 | 合作平台 |
 | `/flights/skylite` | SkyLite 简翼在线机组 | 合作平台 |
 
 用法示例：
-- `curl -s "https://data.dubhenexus.org/api/airport/metar/VHHH"
--  `curl -s "https://data.dubhenexus.org/api/flights/isfp"
--  `curl -s "https://data.dubhenexus.org/api/airport/VHHH"
+- `curl -s "https://data.dubhenexus.org/api/airport/metar/VHHH"`
+- `curl -s "https://data.dubhenexus.org/api/flights/isfp"`
+- `curl -s "https://data.dubhenexus.org/api/airport/VHHH"`
+- `curl -s "https://data.dubhenexus.org/api/routes?origin=VHHH&destination=WSSS"`
 
 **严禁使用 aviationweather.gov、isfpapi.flyisfp.com 等外部 API**，全部通过 Dubhe Nexus 代理。
 ATIS/NOTAM 仅 VHHH 有接口，数据可能为空是正常的，直接告知用户即可。
@@ -154,7 +171,7 @@ ATIS/NOTAM 仅 VHHH 有接口，数据可能为空是正常的，直接告知用
 - "查一下CSN1025" / "帮我搜个机组" → 先在 `/flights/isfp` 和 `/flights/skylite` 中匹配呼号
 - "ZGGG的跑道多长" / "白云机场资料" → 调 `/airport/ZGGG`
 - "WSSS航图" / "新加坡有没有航图" → 直接给 `https://efb.dubhenexus.org/en/charts?icao=wsss&provider=jeppesen`
-- "帮我算一下VHHH到ZBAA的航路" → 给 `https://efb.dubhenexus.org/routes`
+- "帮我算一下VHHH到WSSS的航路" -> 调 `/api/routes?origin=VHHH&destination=WSSS`（也可提示 EFB https://efb.dubhenexus.org/routes）
 - "香港ATIS" / "VHHH通播" → 调 `/airport/atis/VHHH`
 
 核心原则：只要你的 API 或 EFB 能覆盖的，直接给答案 + Dubhe Nexus 链接，不要推外部服务。
@@ -177,7 +194,7 @@ ATIS/NOTAM 仅 VHHH 有接口，数据可能为空是正常的，直接告知用
     "Dubhe Nexus Innovation and Research Studio",
     "天枢互联服务集成：航空数据查询（METAR/TAF/ATIS/NOTAM/机场/气象）、"
     "在线机组查询（ISFP/SkyLite）、EFB 航图链接引导、知识注入",
-    "2.2.0",
+    "2.3.0",
 )
 class DubheNexusServicesPlugin(Star):
     def __init__(self, context: Context, config=None):
@@ -242,6 +259,21 @@ class DubheNexusServicesPlugin(Star):
         if routable:
             return routable[0]
         return candidates[0] if candidates else None
+
+    @staticmethod
+    def _extract_icaos(text: str) -> list[str]:
+        """按出现顺序提取 ICAO（去重，最多两个），用于航路起降场解析。
+
+        不限定首字母前缀（WSSS 等 W 开头机场合法），用停用词排除英文单词。
+        """
+        found: list[str] = []
+        for c in ICAO_PATTERN.findall(text.upper()):
+            if len(found) >= 2:
+                break
+            if c.lower() in ROUTE_WORD_STOPWORDS or c in found:
+                continue
+            found.append(c)
+        return found
 
     @filter.command("airport")
     async def _airport(self, event: AstrMessageEvent):
@@ -388,10 +420,36 @@ class DubheNexusServicesPlugin(Star):
         event.should_call_llm(False)
         event.stop_event()
 
+    @filter.command("route")
+    async def _route(self, event: AstrMessageEvent):
+        if not self._allowed(event):
+            return
+        text, _ = self._parse_text(event)
+        args = text.split()
+
+        icaos = self._extract_icaos(" ".join(args[1:])) if len(args) >= 2 else []
+        if len(icaos) < 2:
+            yield event.plain_result(
+                "用法: /route <出发ICAO> <到达ICAO>\n例如: /route VHHH WSSS"
+            )
+            event.should_call_llm(False)
+            event.stop_event()
+            return
+
+        origin, dest = icaos[0], icaos[1]
+        try:
+            data = await self._fetch_json(f"/routes?origin={origin}&destination={dest}")
+            result = self._fmt_route(data)
+            yield event.plain_result(result or f"未找到 {origin} -> {dest} 的航路数据。")
+        except Exception as e:
+            logger.error(f"航路查询失败 {origin}->{dest}: {e}")
+            yield event.plain_result(f"查询航路失败: {e}")
+        event.should_call_llm(False)
+        event.stop_event()
+
     @filter.event_message_type(
         filter.EventMessageType.GROUP_MESSAGE
-        | filter.EventMessageType.PRIVATE_MESSAGE
-        | filter.EventMessageType.FRIEND_MESSAGE,
+        | filter.EventMessageType.PRIVATE_MESSAGE,
         priority=-20,
     )
     async def _handle_natural_query(self, event: AstrMessageEvent):
@@ -452,6 +510,23 @@ class DubheNexusServicesPlugin(Star):
                 else:
                     raw = await self._fetch_combined_weather(icao)
                 label, hint = "气象", "天气报告"
+            elif any(kw in text_lower for kw in ("航路", "route")):
+                # 航路查询始终直接输出，不走 LLM
+                route_icaos = self._extract_icaos(text)
+                if len(route_icaos) < 2:
+                    return
+                origin, dest = route_icaos[0], route_icaos[1]
+                data = await self._fetch_json(f"/routes?origin={origin}&destination={dest}")
+                raw = self._fmt_route(data)
+                if not raw:
+                    yield event.plain_result(f"未找到 {origin} -> {dest} 的航路数据。")
+                    event.should_call_llm(False)
+                    event.stop_event()
+                    return
+                yield event.plain_result(f"【{origin} -> {dest} 航路】\n{raw}")
+                event.should_call_llm(False)
+                event.stop_event()
+                return
             elif any(kw in text_lower for kw in ("机场", "airport", "跑道", "runway")):
                 data = await self._fetch_json(f"/airport/{icao}")
                 raw = self._fmt_airport(data)
@@ -939,6 +1014,25 @@ class DubheNexusServicesPlugin(Star):
         if raw.get("rawTAF"):
             lines.append(f"\n最新 TAF:\n{raw['rawTAF']}")
 
+        return "\n".join(lines)
+
+    @staticmethod
+    def _fmt_route(data: dict) -> str:
+        route = data.get("route") if isinstance(data, dict) else None
+        if not isinstance(route, dict):
+            return ""
+        route_str = (route.get("string") or "").strip()
+        if not route_str:
+            return ""
+        lines = [route_str]
+        nm = route.get("distance_nm")
+        km = route.get("distance_km")
+        if nm is not None and km is not None:
+            lines.append(f"全程{nm:g}nm ({km:g}km)")
+        elif nm is not None:
+            lines.append(f"全程{nm:g}nm")
+        elif km is not None:
+            lines.append(f"全程{km:g}km")
         return "\n".join(lines)
 
     @staticmethod
